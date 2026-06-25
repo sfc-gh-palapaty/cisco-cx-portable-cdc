@@ -1,0 +1,299 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Cisco CX CDC - Portable Pipeline Benchmark</title>
+<style>
+*{box-sizing:border-box;margin:0;padding:0}body{font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif;background:#0f1419;color:#e1e8ed;line-height:1.6;padding:40px 20px}.container{max-width:1300px;margin:0 auto}h1{font-size:2.2em;margin-bottom:8px;background:linear-gradient(90deg,#29b5f6,#66bb6a);-webkit-background-clip:text;-webkit-text-fill-color:transparent}h2{font-size:1.5em;color:#29b5f6;margin:44px 0 16px;border-bottom:1px solid #2d3748;padding-bottom:8px}h3{font-size:1.15em;color:#81c784;margin:24px 0 12px}h4{font-size:1em;color:#b0bec5;margin:16px 0 8px}.subtitle{color:#8899a6;font-size:1.05em;margin-bottom:30px}.card{background:#1a2332;border:1px solid #2d3748;border-radius:12px;padding:24px;margin:16px 0}.card-success{border-left:4px solid #66bb6a}.card-blue{border-left:4px solid #29b5f6}.card-warn{border-left:4px solid #ffa726}table{width:100%;border-collapse:collapse;margin:16px 0;font-size:.92em}th{background:#1e2d3d;color:#29b5f6;padding:11px 12px;text-align:left;font-weight:600}td{padding:9px 12px;border-bottom:1px solid #2d3748}tr:hover td{background:#1e2d3d}code{background:#1e2d3d;color:#81c784;padding:2px 6px;border-radius:4px;font-size:.88em}pre{background:#1e2d3d;border:1px solid #2d3748;border-radius:8px;padding:16px;overflow-x:auto;font-size:.8em;line-height:1.5;color:#b0bec5}.match{color:#66bb6a;font-weight:600}.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(200px,1fr));gap:16px;margin:16px 0}.stat-card{background:#1a2332;border:1px solid #2d3748;border-radius:8px;padding:20px;text-align:center}.metric{font-size:2em;font-weight:700;color:#66bb6a}.metric-label{font-size:.8em;color:#8899a6;text-transform:uppercase;letter-spacing:1px}.two-col{display:grid;grid-template-columns:1fr 1fr;gap:16px}@media(max-width:900px){.two-col{grid-template-columns:1fr}}footer{margin-top:60px;text-align:center;color:#8899a6;font-size:.85em;border-top:1px solid #2d3748;padding-top:20px}ul,ol{padding-left:20px;margin:8px 0}li{margin:4px 0}
+</style>
+</head>
+<body>
+<div class="container">
+
+<h1>Cisco CX: Portable CDC Pipeline</h1>
+<p class="subtitle">Platform-Agnostic Change Data Capture | Polars, PySpark, Ibis/DuckDB<br>Snowflake SPCS (Cloud) &amp; EC2/Docker (On-Prem) | 10M Device Telemetry Records</p>
+
+<h2>1. Business Context</h2>
+
+<div class="card card-blue">
+<p>Cisco CX processes device telemetry for <strong>1,000+ customers</strong> (targeting 10,000 in 6 months) across multiple regions. Each customer's device fleet generates daily snapshots of telemetry data (software versions, utilization metrics, contract status). The CDC pipeline detects what changed between yesterday's snapshot and today's — identifying new devices, removed devices, and devices with updated telemetry.</p>
+
+<p style="margin-top:12px;">The architecture must satisfy two deployment models:</p>
+<ul>
+<li><strong>Cloud (90% of customers):</strong> Process on Snowflake SPCS with managed compute, multi-tenant isolation, and direct Snowflake table writes</li>
+<li><strong>On-Prem / Air-Gapped (DOD, 10%):</strong> Same code runs in Docker containers on customer-controlled infrastructure with no cloud dependency</li>
+</ul>
+
+<p style="margin-top:12px;">This benchmark validates that the <strong>same notebook code</strong> executes identically on both platforms, processing 10M device records and detecting 50K changes in under 60 seconds.</p>
+</div>
+
+<h2>2. Architecture</h2>
+
+<h3>2.1 Production Data Flow</h3>
+<div class="card">
+<pre>
+  ┌────────────────────────────────────────────────────────────────────────┐
+  │  CUSTOMER DATA LANDSCAPE                                               │
+  │                                                                        │
+  │  Previous State (Snowflake)          New Arrival (S3 Landing Zone)     │
+  │  ┌──────────────────────────┐        ┌──────────────────────────┐     │
+  │  │ PREV_SNAPSHOT_STAGING    │        │ s3://cisco-cx-cdc-pilot/ │     │
+  │  │ 10,000,000 device records│        │ curr_snapshot/           │     │
+  │  │ (loaded from prior run)  │        │ 10,020,000 records       │     │
+  │  │                          │        │ (daily parquet drop)     │     │
+  │  └────────────┬─────────────┘        └────────────┬─────────────┘     │
+  │               │                                   │                    │
+  │               │ Read from Snowflake               │ Read from S3       │
+  │               │ (session.sql / connector)         │ (PyArrow / Spark)  │
+  │               v                                   v                    │
+  │         ┌─────────────────────────────────────────────┐               │
+  │         │         CDC ENGINE (portable)                │               │
+  │         │                                             │               │
+  │         │   1. Hash compare columns (6 fields)        │               │
+  │         │   2. Full outer join on device_id            │               │
+  │         │   3. Classify: INSERT / UPDATE / DELETE      │               │
+  │         │   4. Extract 43,952 changed rows            │               │
+  │         │                                             │               │
+  │         │   Engines: Polars (Rust) | Spark (JVM) |    │               │
+  │         │            Ibis/DuckDB (C++)                 │               │
+  │         └─────────────────────┬───────────────────────┘               │
+  │                               │                                        │
+  │                               │ TRUNCATE + write_pandas()              │
+  │                               v                                        │
+  │         ┌─────────────────────────────────────────────┐               │
+  │         │  Snowflake: CISCO_CX_PILOT.PROCESSED        │               │
+  │         │  *_CDC_RESULT (43,952 changed rows)         │               │
+  │         └─────────────────────────────────────────────┘               │
+  └────────────────────────────────────────────────────────────────────────┘
+</pre>
+</div>
+
+<h3>2.2 Multi-Customer Execution Model</h3>
+<div class="card">
+<pre>
+  ┌───────────────────────────────────────────────────────────────────────┐
+  │  MULTI-TENANT PROCESSING                                              │
+  │                                                                       │
+  │  Customer A    Customer B    Customer C    ...    Customer N           │
+  │  (500 devices) (10K devices) (50K devices)       (100K devices)       │
+  │       │              │             │                    │              │
+  │       │    Each customer's data in separate S3 prefix / SF schema     │
+  │       │              │             │                    │              │
+  │       v              v             v                    v              │
+  │  ┌──────────────────────────────────────────────────────────────┐     │
+  │  │  SAME NOTEBOOK CODE (parameterized by customer_id/schema)    │     │
+  │  │                                                              │     │
+  │  │  On Snowflake SPCS:                                          │     │
+  │  │    - Compute pool auto-scales (1-N nodes)                    │     │
+  │  │    - Each customer in isolated schema                        │     │
+  │  │    - Concurrent execution via notebook scheduler             │     │
+  │  │                                                              │     │
+  │  │  On-Prem (Docker/K8s):                                       │     │
+  │  │    - Same .ipynb deployed as container job                   │     │
+  │  │    - Kubernetes CronJob per customer                         │     │
+  │  │    - MinIO for S3-compatible storage                         │     │
+  │  │    - PostgreSQL for local state management                  │     │
+  │  └──────────────────────────────────────────────────────────────┘     │
+  └───────────────────────────────────────────────────────────────────────┘
+</pre>
+</div>
+
+<h3>2.3 Polars Data Flow</h3>
+<div class="card card-success">
+<pre>
+  Snowflake PREV_SNAPSHOT ──session.sql()──▶ pandas ──pl.from_pandas()──▶ Polars DF
+                                                                              │
+  S3 curr_snapshot/ ──PyArrow S3FileSystem──▶ pandas ──pl.from_pandas()──▶ Polars DF
+                                                                              │
+                                                  ┌───────────────────────────┘
+                                                  v
+                                          Polars Engine (Rust)
+                                                  │
+                                  concat_str().hash()    [xxHash64, multi-threaded]
+                                  .join(how='full')      [parallel hash join]
+                                  .filter()              [classify I/U/D]
+                                                  │
+                                                  v
+                                          43,952 changed rows
+                                                  │
+                                  .to_pandas() ──▶ write_pandas() ──▶ Snowflake
+</pre>
+</div>
+
+<h3>2.4 PySpark Data Flow</h3>
+<div class="card card-blue">
+<pre>
+  Snowflake PREV_SNAPSHOT ──session.sql()──▶ pandas ──createDataFrame()──▶ Spark DF
+                                                                               │
+  S3 curr_snapshot/ ──spark.read.parquet("s3a://")──────────────────────▶ Spark DF
+                                                                               │
+                                                  ┌────────────────────────────┘
+                                                  v
+                                          Spark Engine (JVM Tungsten)
+                                                  │
+                                  md5(concat_ws())       [JVM native, no Python]
+                                  .join(how='full')      [sort-merge, 28 cores]
+                                  when().otherwise()     [classify I/U/D]
+                                                  │
+                                                  v
+                                          43,952 changed rows
+                                                  │
+                                  broadcast() + .toPandas() ──▶ write_pandas() ──▶ Snowflake
+</pre>
+</div>
+
+<h3>2.5 Ibis/DuckDB Data Flow</h3>
+<div class="card card-warn">
+<pre>
+  Snowflake PREV_SNAPSHOT ──session.sql()──▶ pandas ──con.create_table()──▶ DuckDB Table
+                                                                                │
+  S3 curr_snapshot/ ──PyArrow S3FileSystem──▶ pandas ──con.create_table()──▶ DuckDB Table
+                                                                                │
+                                                  ┌─────────────────────────────┘
+                                                  v
+                                          DuckDB Engine (C++ vectorized)
+                                                  │
+                                  ibis.literal('|').join().hash()  [native hash]
+                                  .outer_join()                    [hash join]
+                                  .filter()                        [classify I/U/D]
+                                                  │
+                                                  v
+                                          43,952 changed rows
+                                                  │
+                                  .execute() ──▶ pandas ──▶ write_pandas() ──▶ Snowflake
+</pre>
+</div>
+
+<h2>3. Runtime Results</h2>
+
+<div class="grid">
+<div class="stat-card"><div class="metric-label">Source Data</div><div class="metric">10M</div><div class="metric-label">rows per snapshot</div></div>
+<div class="stat-card"><div class="metric-label">Changes Detected</div><div class="metric">43,952</div><div class="metric-label">rows written</div></div>
+<div class="stat-card"><div class="metric-label">S3 Parquet</div><div class="metric">394 MB</div><div class="metric-label">21 files</div></div>
+<div class="stat-card"><div class="metric-label">Customers Simulated</div><div class="metric">10K</div><div class="metric-label">unique customer_ids</div></div>
+</div>
+
+<h3>Snowflake SPCS (HIGHMEM_X64_L, 28 cores, 128GB)</h3>
+<table>
+<thead><tr><th>Framework</th><th>Read Prev (Snowflake)</th><th>Read Curr (S3)</th><th>CDC Compute</th><th>Write to Snowflake</th><th>Total Pipeline</th></tr></thead>
+<tbody>
+<tr><td><strong>Polars 1.39</strong></td><td>13.4s</td><td>7.6s</td><td>11.7s</td><td>5.4s</td><td><strong>39.5s</strong></td></tr>
+<tr><td><strong>PySpark 3.5</strong></td><td>23.3s</td><td>1.1s</td><td>6.8s</td><td>9.8s</td><td><strong>41.9s</strong></td></tr>
+<tr><td><strong>Ibis/DuckDB 12.0</strong></td><td>14.1s</td><td>8.2s</td><td>17.5s</td><td>6.1s</td><td><strong>47.2s</strong></td></tr>
+</tbody>
+</table>
+
+<h3>EC2 / On-Prem (r5.4xlarge, 16 cores, 124GB)</h3>
+<table>
+<thead><tr><th>Framework</th><th>Read Prev (Snowflake)</th><th>Read Curr (S3)</th><th>CDC Compute</th><th>Write to Snowflake</th><th>Total Pipeline</th></tr></thead>
+<tbody>
+<tr><td><strong>Polars 1.41</strong></td><td>9.9s</td><td>9.5s</td><td>20.1s</td><td>14.7s</td><td><strong>34.7s</strong></td></tr>
+<tr><td><strong>PySpark 3.5</strong></td><td>27.7s</td><td>1.0s</td><td>15.4s</td><td>9.6s</td><td><strong>53.6s</strong></td></tr>
+<tr><td><strong>Ibis/DuckDB 12.0</strong></td><td>17.5s</td><td>10.4s</td><td>26.2s</td><td>6.9s</td><td><strong>61.0s</strong></td></tr>
+</tbody>
+</table>
+
+<h3>CDC Correctness Validation</h3>
+<table>
+<thead><tr><th></th><th>Polars SPCS</th><th>Polars EC2</th><th>Spark SPCS</th><th>Spark EC2</th><th>Ibis SPCS</th><th>Ibis EC2</th></tr></thead>
+<tbody>
+<tr><td>Previous Rows</td><td class="match">10,000,000</td><td class="match">10,000,000</td><td class="match">10,000,000</td><td class="match">10,000,000</td><td class="match">10,000,000</td><td class="match">10,000,000</td></tr>
+<tr><td>Current Rows</td><td class="match">10,020,000</td><td class="match">10,020,000</td><td class="match">10,020,000</td><td class="match">10,020,000</td><td class="match">10,020,000</td><td class="match">10,020,000</td></tr>
+<tr><td>Inserts</td><td class="match">25,000</td><td class="match">25,000</td><td class="match">25,000</td><td class="match">25,000</td><td class="match">25,000</td><td class="match">25,000</td></tr>
+<tr><td>Updates</td><td class="match">18,952</td><td class="match">18,952</td><td class="match">18,952</td><td class="match">18,952</td><td class="match">18,952</td><td class="match">18,952</td></tr>
+<tr><td>Deletes</td><td class="match">5,000</td><td class="match">5,000</td><td class="match">5,000</td><td class="match">5,000</td><td class="match">5,000</td><td class="match">5,000</td></tr>
+<tr><td>Rows Written</td><td class="match">43,952</td><td class="match">43,952</td><td class="match">43,952</td><td class="match">43,952</td><td class="match">43,952</td><td class="match">43,952</td></tr>
+</tbody>
+</table>
+
+<h2>4. CDC Algorithm</h2>
+<div class="card">
+<pre>
+1. Read previous snapshot (10M rows) from Snowflake — represents yesterday's device state
+2. Read current snapshot (10.02M rows) from S3 parquet — today's telemetry arrival
+3. Compute hash of compare columns per device:
+     software_version | cpu_utilization | memory_utilization |
+     critical_bugs_count | contract_status | ip_address
+4. Full outer join on device_id (primary key)
+5. Classify each device:
+     hash_prev IS NULL       = INSERT  (new device onboarded)
+     hash_curr IS NULL       = DELETE  (device decommissioned)
+     hash_curr != hash_prev  = UPDATE  (telemetry values changed)
+6. Extract inserts + updates from current snapshot
+7. TRUNCATE target table, write changed rows via write_pandas()
+</pre>
+</div>
+
+<h2>5. Package Dependencies</h2>
+
+<div class="two-col">
+<div class="card">
+<h4>Polars</h4>
+<pre>pip install polars pyarrow snowflake-connector-python[pandas]</pre>
+<ul><li><code>polars</code> — Rust DataFrame engine</li><li><code>pyarrow</code> — S3 parquet reader</li><li><code>pandas</code> — Snowflake I/O bridge</li><li><code>snowflake-connector-python</code> — write_pandas()</li></ul>
+</div>
+<div class="card">
+<h4>PySpark</h4>
+<pre>apt-get install default-jdk
+pip install pyspark pyarrow snowflake-connector-python[pandas]</pre>
+<ul><li><code>pyspark</code> — Spark SQL engine</li><li><code>hadoop-aws</code> — S3A filesystem (auto-downloaded)</li><li><code>Java JDK 11+</code> — JVM runtime</li><li><code>pyarrow</code> — Arrow data transfer</li><li><code>snowflake-connector-python</code> — write_pandas()</li></ul>
+</div>
+</div>
+<div class="card">
+<h4>Ibis/DuckDB</h4>
+<pre>pip install ibis-framework[duckdb] pyarrow snowflake-connector-python[pandas]</pre>
+<ul><li><code>ibis-framework</code> — portable DataFrame API</li><li><code>duckdb</code> — embedded C++ analytical engine</li><li><code>pyarrow</code> — S3 parquet reader</li><li><code>snowflake-connector-python</code> — write_pandas()</li></ul>
+</div>
+
+<h2>6. Portability</h2>
+
+<div class="card card-success">
+<h4 style="margin-top:0;">What changes between Snowflake SPCS and On-Prem</h4>
+<table>
+<thead><tr><th>Component</th><th>Changes?</th><th>Details</th></tr></thead>
+<tbody>
+<tr><td>CDC Logic (hash, join, classify)</td><td class="match">NONE</td><td>Identical code on both platforms</td></tr>
+<tr><td>Read prev from Snowflake</td><td class="match">NONE</td><td><code>get_active_session()</code> on SPCS, <code>connector.connect()</code> on EC2</td></tr>
+<tr><td>Read curr from S3</td><td class="match">NONE</td><td>Same PyArrow S3FileSystem / Spark S3A on both</td></tr>
+<tr><td>Write results to Snowflake</td><td class="match">NONE</td><td>Same write_pandas() API</td></tr>
+<tr><td>S3 credentials</td><td>Config only</td><td>SPCS: Snowflake credential store. EC2: AWS env vars</td></tr>
+<tr><td>Snowflake auth</td><td>Config only</td><td>SPCS: active session. EC2: connection_name in .toml</td></tr>
+</tbody>
+</table>
+</div>
+
+<div class="card card-blue">
+<h4 style="margin-top:0;">Deployment Options</h4>
+<table>
+<thead><tr><th>Platform</th><th>Setup</th></tr></thead>
+<tbody>
+<tr><td><strong>Snowflake SPCS</strong></td><td>Upload .ipynb to Workspace, connect compute pool, install packages</td></tr>
+<tr><td><strong>AWS EC2</strong></td><td><code>pip install ...</code> + AWS env vars + Snowflake connection</td></tr>
+<tr><td><strong>Docker (on-prem)</strong></td><td>Pre-built image with all packages, S3-compatible storage</td></tr>
+<tr><td><strong>Kubernetes</strong></td><td>Same Docker image, CronJob per customer, service account for S3</td></tr>
+<tr><td><strong>Air-Gapped (DOD)</strong></td><td>Docker image + MinIO + local Snowflake or Iceberg write</td></tr>
+</tbody>
+</table>
+</div>
+
+<h2>7. Infrastructure</h2>
+<div class="card">
+<table>
+<tr><td><strong>S3 Bucket</strong></td><td><code>s3://cisco-cx-cdc-pilot/cdc_data/</code></td></tr>
+<tr><td><strong>Snowflake Database</strong></td><td><code>CISCO_CX_PILOT.PROCESSED</code></td></tr>
+<tr><td><strong>Staging Table</strong></td><td><code>PREV_SNAPSHOT_STAGING</code> (10M rows, represents prior device state)</td></tr>
+<tr><td><strong>Result Tables</strong></td><td><code>POLARS_CDC_RESULT</code>, <code>SPARK_CDC_RESULT</code>, <code>IBIS_CDC_RESULT</code></td></tr>
+<tr><td><strong>SPCS Compute Pool</strong></td><td>CISCO_CDC_POOL (HIGHMEM_X64_L, 28 cores, 128GB, auto-suspend 5min)</td></tr>
+<tr><td><strong>EC2 Instance</strong></td><td>r5.4xlarge (16 cores, 124GB, Ubuntu 22.04, us-east-1)</td></tr>
+</table>
+</div>
+
+<footer>
+<p>Cisco CX Portable CDC Benchmark | June 18, 2026</p>
+<p>Snowflake: FZB62295.us-east-1 | S3: cisco-cx-cdc-pilot | SPCS: HIGHMEM_X64_L 28 cores</p>
+</footer>
+
+</div>
+</body>
+</html>
